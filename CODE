@@ -1,0 +1,176 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// ---------- CHANGE THESE ----------
+const char* WIFI_SSID = "GNXS-949a38";
+const char* WIFI_PASS = "BC62D2949A38";
+const char* UPI_ID    = "BC62D2949A38";
+const char* SHOP_NAME = "Smart Trolley";
+// ----------------------------------
+
+#define SS_PIN  5
+#define RST_PIN 22
+#define BUZZER_PIN 4
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+WebServer server(80);
+
+struct Item {
+  String uid;
+  String name;
+  int    price;
+  bool   inCart;
+};
+
+Item items[3] = {
+  {"A2 AE C5 1C", "Milk",    30, false},
+  {"92 95 DA 1C", "Bread",   40, false},
+  {"B7 F5 71 60", "Biscuit", 20, false}
+};
+
+unsigned long lastScan = 0;
+
+int getTotal() {
+  int t = 0;
+  for (int i = 0; i < 3; i++) if (items[i].inCart) t += items[i].price;
+  return t;
+}
+
+String readUID() {
+  String s = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) s += "0";
+    s += String(rfid.uid.uidByte[i], HEX);
+    if (i < rfid.uid.size - 1) s += " ";
+  }
+  s.toUpperCase();
+  return s;
+}
+
+void beep(int times, int onMs, int offMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(onMs);
+    digitalWrite(BUZZER_PIN, LOW);
+    if (i < times - 1) delay(offMs);
+  }
+}
+
+const char PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Trolley</title>
+<style>
+ body{font-family:Arial,sans-serif;background:#f2f4f8;margin:0;padding:16px}
+ .card{max-width:460px;margin:auto;background:#fff;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0002}
+ h2{text-align:center;margin-top:0}
+ table{width:100%;border-collapse:collapse}
+ th,td{padding:10px;text-align:left;border-bottom:1px solid #eee}
+ .total{font-size:22px;font-weight:bold;text-align:right;margin:14px 0}
+ .btn{display:block;text-align:center;padding:14px;border-radius:10px;text-decoration:none;
+      color:#fff;font-size:18px;margin-top:10px;border:none;width:100%}
+ .pay{background:#1a9c4b}.done{background:#2563eb}
+ .empty{text-align:center;color:#888;padding:20px}
+</style></head><body>
+<div class="card">
+ <h2>&#128722; Smart Trolley Bill</h2>
+ <table><thead><tr><th>Item</th><th>Price</th></tr></thead><tbody id="rows"></tbody></table>
+ <div class="total">Total: &#8377;<span id="total">0</span></div>
+ <a id="payBtn" class="btn pay" href="#">Pay with UPI</a>
+ <button class="btn done" onclick="paid()">I have paid / Clear cart</button>
+</div>
+<script>
+async function load(){
+  try{
+    const r = await fetch('/data'); const d = await r.json();
+    let h='';
+    d.items.forEach(i=>{ h+='<tr><td>'+i.name+'</td><td>&#8377;'+i.price+'</td></tr>'; });
+    if(!d.items.length) h='<tr><td colspan=2 class="empty">Cart is empty. Scan an item.</td></tr>';
+    document.getElementById('rows').innerHTML=h;
+    document.getElementById('total').innerText=d.total;
+    document.getElementById('payBtn').href=d.upi;
+  }catch(e){}
+}
+async function paid(){ await fetch('/paid'); load(); alert('Thank you! Cart cleared.'); }
+load(); setInterval(load,2000);
+</script></body></html>
+)rawliteral";
+
+void handleRoot() { server.send_P(200, "text/html", PAGE); }
+
+void handleData() {
+  String json = "{\"items\":[";
+  bool first = true;
+  for (int i = 0; i < 3; i++) {
+    if (items[i].inCart) {
+      if (!first) json += ",";
+      json += "{\"name\":\"" + items[i].name + "\",\"price\":" + String(items[i].price) + "}";
+      first = false;
+    }
+  }
+  int total = getTotal();
+  json += "],\"total\":" + String(total);
+  json += ",\"upi\":\"upi://pay?pa=" + String(UPI_ID) + "&pn=" + String(SHOP_NAME) +
+          "&am=" + String(total) + "&cu=INR&tn=Trolley%20Bill\"}";
+  server.send(200, "application/json", json);
+}
+
+void handlePaid() {
+  for (int i = 0; i < 3; i++) items[i].inCart = false;
+  Serial.println("Payment done. Cart cleared.");
+  server.send(200, "text/plain", "OK");
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  SPI.begin();
+  rfid.PCD_Init();
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println();
+  Serial.print("Open this in browser: http://");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/paid", handlePaid);
+  server.begin();
+  Serial.println("Ready. Scan a tag...");
+}
+
+void loop() {
+  server.handleClient();
+
+  if (millis() - lastScan < 1500) return;
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+  String uid = readUID();
+  lastScan = millis();
+  Serial.println("Tag UID: " + uid);
+
+  bool found = false;
+  for (int i = 0; i < 3; i++) {
+    if (items[i].uid == uid) {
+      items[i].inCart = !items[i].inCart;
+      Serial.println(String(items[i].inCart ? "ADDED: " : "REMOVED: ") + items[i].name);
+      Serial.println("Total = Rs." + String(getTotal()));
+      if (items[i].inCart) beep(1, 150, 0);
+      else                 beep(2, 100, 100);
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    Serial.println("Unknown tag - copy this UID into the items[] list.");
+    beep(1, 600, 0);
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
